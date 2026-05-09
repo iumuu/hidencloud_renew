@@ -378,17 +378,25 @@ class HidenCloudBot:
             return False
 
         positive_keywords = [
-            'unpaid', 'pending', 'pay now', 'payment due',
+            'unpaid', 'pending', 'pay now', 'payment due', 'pay invoice',
+            'pendiente', 'pagar ahora', 'sin pagar',
             '未支付', '待支付', '待付款', '立即支付', '去支付', '付款', '支付'
         ]
         negative_keywords = [
             'paid', 'completed', 'cancelled', 'canceled', 'refunded',
+            'pagado', 'completado', 'cancelado', 'reembolsado',
             '已支付', '已付款', '已完成', '已取消', '已退款', '作废'
         ]
 
-        has_positive = any(keyword in normalized for keyword in positive_keywords)
-        has_negative = any(keyword in normalized for keyword in negative_keywords)
+        has_positive = any(self.contains_context_keyword(normalized, keyword) for keyword in positive_keywords)
+        has_negative = any(self.contains_context_keyword(normalized, keyword) for keyword in negative_keywords)
         return has_positive and not has_negative
+
+    def contains_context_keyword(self, normalized_text, keyword):
+        if re.search(r'[a-z0-9]', keyword):
+            pattern = rf'(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])'
+            return re.search(pattern, normalized_text) is not None
+        return keyword in normalized_text
 
     def extract_invoice_links(self, soup, require_payment_context=False):
         invoice_links = []

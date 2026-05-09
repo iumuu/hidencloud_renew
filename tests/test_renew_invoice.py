@@ -86,6 +86,12 @@ class RenewInvoiceHandlingTests(unittest.TestCase):
         self.assertEqual(result, "non_payable")
         self.assertIn(invoice_url, bot.non_payable_invoices)
 
+    def test_unpaid_status_is_not_blocked_by_paid_substring(self):
+        bot = self.make_bot()
+
+        self.assertTrue(bot.has_invoice_payment_context("Invoice status: Unpaid"))
+        self.assertFalse(bot.has_invoice_payment_context("Invoice status: Paid"))
+
     def test_invoice_poll_only_succeeds_when_an_invoice_is_paid(self):
         bot = self.make_bot()
         bot.request = Mock(return_value=FakeResponse(
@@ -97,6 +103,21 @@ class RenewInvoiceHandlingTests(unittest.TestCase):
             paid = bot.check_and_pay_invoices("147008", is_precheck=True)
 
         self.assertFalse(paid)
+
+    def test_invoice_poll_finds_english_unpaid_invoice(self):
+        bot = self.make_bot()
+        bot.request = Mock(return_value=FakeResponse(
+            '<table><tr><td>Unpaid</td><td><a href="/payment/invoice/current">View</a></td></tr></table>'
+        ))
+        bot.pay_single_invoice = Mock(return_value="paid")
+
+        with patch("main.sleep_random"), patch("main.time.sleep"):
+            paid = bot.check_and_pay_invoices("147008", is_precheck=True)
+
+        self.assertTrue(paid)
+        bot.pay_single_invoice.assert_called_once_with(
+            "https://dash.hidencloud.com/payment/invoice/current"
+        )
 
     def test_pay_single_invoice_skips_known_non_payable_without_request(self):
         bot = self.make_bot()
