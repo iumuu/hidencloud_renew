@@ -1,4 +1,3 @@
-20260613 03:11:09 || 把Infinicloud换成pcloud # -*- coding: utf-8 -*-
 """
 HidenCloud 自动续期 - Python 全日志推送版
 """
