@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 HidenCloud 自动续期 - Python 全日志推送版
 """
