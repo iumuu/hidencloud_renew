@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-HidenCloud 自动续期 - Python 全日志推送版
-新增功能：Cookie失效后自动使用账号密码登录并更新Cookie缓存
+HidenCloud 自动续期 - Python 全日志推送版 (支持账号密码后备登录)
 """
 import os
 import sys
@@ -13,7 +12,14 @@ import requests
 import cloudscraper
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, unquote
-from notify import send_notify
+
+# 尝试导入通知模块，如果没有则跳过
+try:
+    from notify import send_notify
+except ImportError:
+    def send_notify(title, content):
+        print(f"通知模块未加载: {title}\n{content}")
+
 try:
     from cookie_context import normalize_cookie_records, parse_seed_cookie_string, success_path_label
 except ModuleNotFoundError:
@@ -100,6 +106,7 @@ except ModuleNotFoundError:
             return '重建会话后重试进入成功路径' if rebuild_retry else '同会话重试后进入成功路径'
         return '进入成功路径'
 
+
 # ================= 配置常量 =================
 RENEW_DAYS = 7
 CACHE_FILE_NAME = 'hiden_cookies.json'
@@ -111,6 +118,7 @@ ALL_LOGS = []
 def log_print(msg):
     print(msg)
     ALL_LOGS.append(str(msg))
+
 
 # ================= WebDAV 模块 =================
 class WebDavManager:
@@ -163,6 +171,7 @@ class WebDavManager:
         except Exception as e:
             log_print(f"❌ WebDAV 上传错误: {e}")
 
+
 # ================= 辅助工具 =================
 def sleep_random(min_ms=3000, max_ms=8000):
     sec = random.randint(min_ms, max_ms) / 1000.0
@@ -196,23 +205,21 @@ class CacheManager:
         if upload:
             WebDavManager().upload(data)
 
+
 # ================= 核心机器人类 =================
 class HidenCloudBot:
-    def __init__(self, env_cookie, username, password, index):
+    def __init__(self, env_cookie, index, email=None, password=None):
         self.index = index + 1
         self.base_url = "https://dash.hidencloud.com"
         self.env_cookie = env_cookie
-        self.username = username.strip()
-        self.password = password.strip()
+        self.email = email
+        self.password = password
         self.session = self.create_session()
 
         self.csrf_token = ""
         self.services = []
-        # 跨服务去重集合，避免对同一张账单反复尝试支付
         self.processed_invoices = set()
-        # 本轮运行中已确认当前页面不可支付的账单，避免每个服务重复打开
         self.non_payable_invoices = set()
-        # 标记本账号本轮是否建议由 GitHub Actions 稍后重跑一次
         self.retry_needed = False
 
         cached_data = CacheManager.load()
@@ -257,7 +264,7 @@ class HidenCloudBot:
             )
 
     def get_cookie_str(self):
-        return '; '.join([f"{c.name}={c.value}" for c in self.session.cookies])
+        return ';'.join([f"{c.name}={c.value}" for c in self.session.cookies])
 
     def normalize_critical_cookies(self, stage=""):
         records = []
@@ -319,12 +326,10 @@ class HidenCloudBot:
             if domain_matches:
                 matches = domain_matches
 
-        # requests 在同名 cookie 上可能抛 CookieConflictError，这里手动挑一个最合适的值。
         matches.sort(key=lambda cookie: (len(cookie.domain or ''), len(cookie.path or '')))
         return matches[-1].value
 
     def save_cookies(self, upload=True):
-        """由关键操作节点显式调用，而非每次请求都触发。"""
         CacheManager.update(self.index - 1, self.get_cookie_str(), upload=upload)
 
     def reset_to_env(self, env_cookie):
@@ -362,12 +367,10 @@ class HidenCloudBot:
             raise
 
     def _refresh_csrf(self, soup):
-        """从页面 HTML 中刷新 CSRF token，防止因 token 过期导致 419 错误。"""
         token_tag = soup.find('meta', attrs={'name': 'csrf-token'})
         if token_tag:
             self.csrf_token = token_tag['content']
             return
-        # 降级：从表单 _token 字段读取
         token_input = soup.find('input', attrs={'name': '_token'})
         if token_input:
             self.csrf_token = token_input['value']
@@ -595,79 +598,52 @@ class HidenCloudBot:
             return True, 'invoice_poll'
         return False, None
 
-    def login(self):
-        """使用账号密码自动登录，成功返回True并更新Cookie缓存，失败返回False"""
-        if not self.username or not self.password:
-            self.log("⚠️ 未配置账号密码，跳过自动登录尝试")
+    def login_with_password(self):
+        """核心后备登录模块"""
+        if not self.email or not self.password:
+            self.log("(＞人＜;) Cookie已失效，且未提供账号密码，无法执行重新登录")
             return False
-
-        self.log("🔑 检测到Cookie失效，尝试使用账号密码自动登录...")
-        try:
-            # 1. 清空当前会话Cookie，准备全新登录
-            self.session.cookies.clear()
             
-            # 2. 访问登录页面获取CSRF Token和Cloudflare验证
-            login_page_res = self.request('GET', '/login')
-            if '/dashboard' in login_page_res.url or login_page_res.url == self.base_url + '/':
-                self.log("✅ 已处于登录状态，无需重新登录")
-                return True
-
-            soup = BeautifulSoup(login_page_res.text, 'html.parser')
+        self.log(f"🔄 (ง •̀_•́)ง 尝试使用账号密码重新登录: {self.email}")
+        try:
+            # 1. 获取登录页以刷新 CSRF Token
+            res = self.request('GET', '/login')
+            soup = BeautifulSoup(res.text, 'html.parser')
             self._refresh_csrf(soup)
 
-            # 3. 提取登录表单并构造请求数据
-            login_form = soup.find('form', attrs={'action': '/login'})
-            if not login_form:
-                self.log("❌ 未找到登录表单，页面结构可能已变更")
-                return False
+            # 2. 提取表单隐藏字段
+            token_input = soup.find('input', attrs={'name': '_token'})
+            token = token_input.get('value', '') if token_input else self.csrf_token
 
-            payload = self.extract_form_payload(login_form)
-            # 覆盖用户名和密码
-            payload['email'] = self.username
-            payload['password'] = self.password
-            # 勾选"记住我"以获得更长有效期的Cookie
-            payload['remember'] = 'on'
+            payload = {
+                '_token': token,
+                'email': self.email,
+                'password': self.password,
+                'remember': 'on'
+            }
 
-            # 4. 提交登录请求
-            self.log(f"正在以账号 {self.username} 进行登录...")
-            login_res = self.request('POST', '/login', data=payload, headers={
+            headers = {
+                'X-CSRF-TOKEN': self.csrf_token,
                 'Referer': self.normalize_url('/login'),
-                'Origin': self.base_url,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-            })
+                'Origin': self.base_url
+            }
 
-            # 5. 验证登录结果
-            if '/dashboard' in login_res.url or login_res.url == self.base_url + '/':
-                self.log("✅ 账号密码登录成功！")
-                
-                # 刷新仪表盘信息和CSRF Token
-                soup_dash = BeautifulSoup(login_res.text, 'html.parser')
-                self._refresh_csrf(soup_dash)
-                
-                # 重新获取服务列表
-                self.services = []
-                for a in soup_dash.find_all('a', href=True):
-                    href = a['href']
-                    if '/service/' in href and '/manage' in href:
-                        svc_id = href.split('/service/')[1].split('/')[0]
-                        if not any(s['id'] == svc_id for s in self.services):
-                            self.services.append({'id': svc_id, 'url': href})
-                
-                self.log(f"✅ 登录成功，发现 {len(self.services)} 个可用服务")
-                # 保存新的Cookie到本地和云端缓存
-                self.save_cookies(upload=True)
-                return True
-            else:
-                # 提取登录错误信息
-                error_msg = self.extract_server_error_message(BeautifulSoup(login_res.text, 'html.parser'))
-                if error_msg:
-                    self.log(f"❌ 登录失败: {error_msg}")
-                else:
-                    self.log(f"❌ 登录失败，未跳转到仪表盘，当前URL: {login_res.url}")
-                return False
+            # 3. 提交登录请求
+            post_res = self.request('POST', '/login', data=payload, headers=headers)
 
+            # 4. 验证是否成功跳转回仪表盘
+            if '/dashboard' in post_res.url or post_res.status_code in [302, 200]:
+                verify_res = self.request('GET', '/dashboard')
+                if '/login' not in verify_res.url:
+                    self.log("(๑•̀ㅂ•́)و✧ 账号密码登录成功！凭证已刷新~")
+                    self.save_cookies(upload=True)
+                    return True
+
+            self.log("(；´д｀)ゞ 账号密码登录失败，请检查账密或是否触发了人机验证")
+            return False
+            
         except Exception as e:
-            self.log(f"❌ 登录过程发生异常: {str(e)}")
+            self.log(f"❌ 登录过程发生异常: {e}")
             return False
 
     def init(self):
@@ -677,7 +653,12 @@ class HidenCloudBot:
 
             if '/login' in res.url:
                 self.log("❌ 当前 Cookie 已失效")
-                return False
+                # 触发后备登录机制
+                if self.login_with_password():
+                    # 登录成功后，重新获取 dashboard 页面供后续解析服务列表
+                    res = self.request('GET', '/dashboard')
+                else:
+                    return False
 
             soup = BeautifulSoup(res.text, 'html.parser')
             log_print(f"👀 [调试] 网页标题是: {soup.title.string if soup.title else '无标题'}")
@@ -705,13 +686,10 @@ class HidenCloudBot:
         self.log(f">>> 处理服务 ID: {service['id']}")
 
         try:
-            # 1. 预检：清理遗留未付账单（已处理过的会被 processed_invoices 过滤）
             self.check_and_pay_invoices(service['id'], is_precheck=True)
 
-            # 2. 获取管理页面，同时刷新 CSRF token
             manage_res, soup = self.fetch_manage_page(service['id'])
 
-            # ================== 3. 检测是否允许续期 ==================
             renew_btn = soup.find('button', onclick=re.compile(r'showRenewAlert'))
             if renew_btn:
                 onclick_val = renew_btn['onclick']
@@ -727,7 +705,6 @@ class HidenCloudBot:
                         self.log(f"⏳ 暂未到达续期时间: {kind}剩余时间低于 {threshold_text} 才可续期。当前剩余: {days_until} 天。")
                         return
 
-            # ================== 4. 执行单次精准续期 ==================
             token_input = soup.find('input', attrs={'name': '_token'})
             if not token_input:
                 self.log("❌ 无法找到续期 Token (可能是服务已到期或页面结构变更)")
@@ -748,7 +725,6 @@ class HidenCloudBot:
                 res = self.submit_renew_request(service['id'], soup, manage_res.url)
                 handled, outcome = False, None
 
-            # ================== 5. 结果校验与支付 ==================
             if not handled:
                 handled, outcome = self.try_handle_invoice_from_response(service['id'], res)
 
@@ -765,13 +741,12 @@ class HidenCloudBot:
                     self.log("❌ 重建会话后仍无法重新登录，放弃本服务本轮续期")
                     self.mark_retry_needed(f"服务 {service['id']} 重建会话后仍无法完成续期")
             elif not handled:
-                self.mark_retry_needed(f"服务 {service['id']} 本轮续期未完成")
+               self.mark_retry_needed(f"服务 {service['id']} 本轮续期未完成")
 
         except Exception as e:
             self.log(f"处理异常: {e}")
             self.mark_retry_needed(f"服务 {service['id']} 处理异常")
         finally:
-            # 每处理完一个服务保存一次 Cookie，而非每次请求都上传
             self.save_cookies(upload=True)
 
     def check_and_pay_invoices(self, service_id, is_precheck=False, retries=1, retry_delay=5):
@@ -784,7 +759,6 @@ class HidenCloudBot:
                 soup = BeautifulSoup(res.text, 'html.parser')
                 invoice_links = self.extract_invoice_links(soup, require_payment_context=True)
 
-                # 过滤掉本次运行中已处理过的账单，避免重复操作
                 unique_invoices = [url for url in set(invoice_links)
                                    if url not in self.processed_invoices
                                    and url not in self.non_payable_invoices]
@@ -850,13 +824,11 @@ class HidenCloudBot:
             if not action or 'balance/add' in action:
                 continue
             btn = form.find('button')
-            # Match both English "pay" and Chinese payment button text
             if btn and ('pay' in btn.get_text().lower() or '支付' in btn.get_text()):
                 target_form = form
                 target_action = action
                 break
 
-        # Fallback: any form whose action contains 'invoice' or 'payment' and has a submit button
         if not target_form:
             for form in soup.find_all('form'):
                 action = form.get('action', '')
@@ -905,67 +877,49 @@ class HidenCloudBot:
             self.mark_retry_needed(f"账单 {normalized_current_url} 支付异常")
             return 'payment_failed'
 
+
 # ================= 主程序 =================
 if __name__ == '__main__':
-    # 新增账号密码环境变量解析
-    env_cookies = os.environ.get("HIDEN_COOKIE", "")
-    env_usernames = os.environ.get("HIDEN_USERNAME", "")
-    env_passwords = os.environ.get("HIDEN_PASSWORD", "")
-    
-    # 统一使用&或换行作为分隔符，支持多账号
-    cookies_list = re.split(r'[&\n]', env_cookies)
-    usernames_list = re.split(r'[&\n]', env_usernames)
-    passwords_list = re.split(r'[&\n]', env_passwords)
-    
-    # 确保三个列表长度一致，不足的用空字符串填充
-    max_accounts = max(len(cookies_list), len(usernames_list), len(passwords_list))
-    cookies_list += [''] * (max_accounts - len(cookies_list))
-    usernames_list += [''] * (max_accounts - len(usernames_list))
-    passwords_list += [''] * (max_accounts - len(passwords_list))
-    
-    # 过滤掉完全空的账号条目
-    valid_accounts = []
-    for i in range(max_accounts):
-        if cookies_list[i].strip() or (usernames_list[i].strip() and passwords_list[i].strip()):
-            valid_accounts.append((cookies_list[i], usernames_list[i], passwords_list[i]))
-    
+    # 支持的新格式: Cookie|邮箱|密码
+    env_configs = os.environ.get("HIDEN_COOKIE", "")
+    account_list = re.split(r'[&\n]', env_configs)
+    account_list = [c for c in account_list if c.strip()]
     any_retry_needed = False
 
-    if not valid_accounts:
-        log_print("❌ 未配置任何有效账号信息，请至少配置HIDEN_COOKIE或HIDEN_USERNAME+HIDEN_PASSWORD")
+    if not account_list:
+        log_print("❌ 未配置环境变量 HIDEN_COOKIE (支持格式: Cookie|邮箱|密码)")
         sys.exit(1)
 
     WebDavManager().download()
 
     log_print(f"\n=== HidenCloud 续期脚本启动 (Python版) ===")
-    log_print(f"共检测到 {len(valid_accounts)} 个有效账号\n")
 
-    for i, (cookie, username, password) in enumerate(valid_accounts):
-        bot = HidenCloudBot(cookie, username, password, i)
+    for i, acc_data in enumerate(account_list):
+        # 解析环境变量中的 Cookie, 邮箱, 密码
+        parts = acc_data.split('|')
+        cookie = parts[0].strip() if len(parts) > 0 else ""
+        email = parts[1].strip() if len(parts) > 1 else None
+        password = parts[2].strip() if len(parts) > 2 else None
+
+        bot = HidenCloudBot(cookie, i, email, password)
         success = bot.init()
 
         if not success:
-            # Cookie失效时优先尝试账号密码登录
-            login_success = bot.login()
-            if login_success:
-                success = True
-            else:
-                # 登录失败后保留原逻辑：重置到原始Cookie再试一次
-                bot.reset_to_env(cookie)
-                success = bot.init()
+            bot.reset_to_env(cookie)
+            success = bot.init()
 
         if success:
             for service in bot.services:
                 bot.process_service(service)
         else:
-            log_print(f"账号 {i + 1}: 登录失败，请检查Cookie或账号密码是否正确")
+            log_print(f"账号 {i + 1}: 登录失败，请检查 Cookie 或 账号密码")
             bot.mark_retry_needed("账号初始化失败")
 
         if bot.retry_needed:
             any_retry_needed = True
 
         log_print("\n----------------------------------------\n")
-        if i < len(valid_accounts) - 1:
+        if i < len(account_list) - 1:
             sleep_random(5000, 10000)
 
     final_content = "\n".join(ALL_LOGS)
